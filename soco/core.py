@@ -12,6 +12,7 @@ import logging
 from textwrap import dedent
 import re
 import itertools
+import inspect
 import requests
 
 from .services import DeviceProperties, ContentDirectory
@@ -96,13 +97,14 @@ class SonosDiscovery(object):  # pylint: disable=R0903
 
 
 class _ArgsSingleton(type):
-    """ A metaclass which permits only a single instance of each derived class
-    sharing the same `_class_group` class attribute to exist for any given set
-    of positional arguments.
+    """ A metaclass which permits only a single instance of each derived
+    class sharing the same `_class_group` class attribute to exist for any
+    given value of a particular constructor argument. The name of the
+    relevant argument is specified by the `_identifier` class attribute.
 
     Attempts to instantiate a second instance of a derived class, or another
-    class with the same `_class_group`, with the same args will return the
-    existing instance.
+    class with the same `_class_group`, with the same value of the argument
+    specified by `_identifier`, will return the existing instance.
 
     For example:
 
@@ -111,11 +113,13 @@ class _ArgsSingleton(type):
     ...
     >>> class First(ArgsSingletonBase):
     ...     _class_group = "greeting"
+    ...     _identifier = "param"
     ...     def __init__(self, param):
     ...         pass
     ...
     >>> class Second(ArgsSingletonBase):
     ...     _class_group = "greeting"
+    ...     _identifier = "param"
     ...     def __init__(self, param):
     ...         pass
     >>> assert First('hi') is First('hi')
@@ -127,13 +131,26 @@ class _ArgsSingleton(type):
     _instances = {}
 
     def __call__(cls, *args, **kwargs):
-        key = cls._class_group if hasattr(cls, '_class_group') else cls
+        key = getattr(cls, '_class_group', cls)
         if key not in cls._instances:
             cls._instances[key] = {}
-        if args not in cls._instances[key]:
-            cls._instances[key][args] = super(_ArgsSingleton, cls).__call__(
+        # Get the names of all the args used by the initialiser, but ignore
+        # the first (which will be self)
+        argnames = inspect.getargspec(cls.__init__).args[1:]
+        # Now get a dict mapping all argnames to argvalues
+        kw = kwargs.copy()
+        kw.update(zip(argnames, args))
+        # Find the value of _identifier from the class, and use it as a key
+        identifier = getattr(cls, '_identifier', None)
+        if identifier is not None:
+            key2 = kw[identifier]
+        else:
+            # make a hashable object, capable of being used as a dict key
+            key2 = frozenset(kw.items())
+        if key2 not in cls._instances[key]:
+            cls._instances[key][key2] = super(_ArgsSingleton, cls).__call__(
                 *args, **kwargs)
-        return cls._instances[key][args]
+        return cls._instances[key][key2]
 
 
 class _SocoSingletonBase(  # pylint: disable=too-few-public-methods
@@ -215,7 +232,7 @@ class SoCo(_SocoSingletonBase):
 
     """
 
-    _class_group = 'SoCo'
+    _identifier = 'ip_address'
 
     def __init__(self, ip_address):
         # Note: Creation of a SoCo instance should be as cheap and quick as
@@ -223,6 +240,7 @@ class SoCo(_SocoSingletonBase):
         super(SoCo, self).__init__()
         # Check if ip_address is a valid IPv4 representation.
         # Sonos does not (yet) support IPv6
+
         try:
             socket.inet_aton(ip_address)
         except socket.error:
@@ -729,20 +747,22 @@ class SoCo(_SocoSingletonBase):
         # and the set of all members
         self._all_zones.clear()
         self._visible_zones.clear()
+        group_coordinator = None
         # Loop over each ZoneGroup Element
         for group_element in tree.findall('ZoneGroup'):
             coordinator_uid = group_element.attrib['Coordinator']
             group_uid = group_element.attrib['ID']
             members = set()
             for member_element in group_element.iter('ZoneGroupMember'):
-                # Create a SoCo instance for each member. Because SoCo
-                # instances are singletons, this is cheap if they have already
-                # been created, and useful if they haven't. We can then
-                # update various properties for that instance.
+                # Create an instance of SoCo (or any relevant subclass) for
+                # each member. Because SoCo instances are singletons, this is
+                # cheap if they have already been created, and useful if
+                # they haven't. We can then update various properties for
+                # that instance.
                 member_attribs = member_element.attrib
                 ip_addr = member_attribs['Location'].\
                     split('//')[1].split(':')[0]
-                zone = SoCo(ip_addr)
+                zone = self.__class__(ip_addr)
                 zone._uid = member_attribs['UUID']
                 # If this element has the same UUID as the coordinator, it is
                 # the coordinator
