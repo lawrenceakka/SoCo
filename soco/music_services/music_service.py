@@ -8,7 +8,9 @@ This module provides the MusicService class and related functionality.
 
 from __future__ import absolute_import, unicode_literals
 
+import base64
 import logging
+import time
 
 import requests
 
@@ -18,6 +20,7 @@ from .. import discovery
 from ..compat import parse_qs, quote_url, urlparse
 from ..exceptions import MusicServiceException
 from ..music_services.accounts import Account
+from ..music_services.capabilities import Capabilities
 from ..soap import SoapFault, SoapMessage
 from ..xml import XML
 
@@ -78,19 +81,78 @@ class MusicServiceSoapClient(object):
             str: A string representation of the XML content of the SOAP
                 header.
         """
+        # According to the SONOS SMAPI, the SOAP header to  be sent with all
+        # SOAP requests must contain a <credentials> element, and may also
+        # contain a <context> element. See here:
+        # http://musicpartners.sonos.com/node/452 and here:
+        # http://musicpartners.sonos.com/node/462
+        #
+        # The precise contents of those two elemetns depends on the
+        # Capabilities of the service, but in general, the expected form is as
+        # follows:
+        # <[ns]:credentials>
+        #  <[ns]:deviceId>[deviceId]</[ns]:deviceId>
+        #  <[ns]:deviceCert>[deviceCert]</deviceCert>
+        #  <[ns]:zonePlayerId>[zonePlayerId]</zonePlayerId>
+        #  <[ns]:deviceProvider>Sonos</[ns]:deviceProvider>
+        #  <[ns]:loginToken>
+        #     <[ns]:token>[authenticationToken]</[ns]:token>
+        #     <[ns]:key>[refreshToken]</[ns]:key>
+        #     <[ns]:householdId>[householdId]</[ns]:householdId>
+        #  </[ns]:loginToken>
+        # </[ns]:credentials>
+        #
+        # <[ns]:context>
+        #   <[ns]:timeZone>
+        #     -05:00
+        #   </[ns]:timeZone>
+        # </[ns]:context>
 
-        # According to the SONOS SMAPI, this header must be sent with all
-        # SOAP requests. Building this is an expensive operation (though
-        # occasionally necessary), so f we have a cached value, return it
+        # If the authentication type is sessionID, the <credentials> element
+        # is simpler:
+        # <[ns]:credentials>
+        #   <[ns]:deviceId>[deviceId]</[ns]:deviceId>
+        #   <[ns]:deviceProvider>Sonos</[ns]:deviceProvider>
+        #   <[ns]:sessionId>[sessionIdentifier]</[ns]:sessionId>
+        # </[ns]:credentials>
+
+        # pylint: disable=too-many-locals
+
+        # Building this header is an expensive operation so if we have a
+        # cached value, return it
         if self._cached_soap_header is not None:
             return self._cached_soap_header
+        # There is no cached value, so begin to build the credentials element
         music_service = self.music_service
-        credentials_header = XML.Element(
+        credentials_element = XML.Element(
             "credentials", {'xmlns': "http://www.sonos.com/Services/1.1"})
-        device_id = XML.SubElement(credentials_header, 'deviceId')
+        # The deviceID subelement is deprecated by Sonos, so services may
+        # ignore it. But we add it anyway, just in case ...
+        device_id = XML.SubElement(credentials_element, 'deviceId')
         device_id.text = self._device_id
-        device_provider = XML.SubElement(credentials_header, 'deviceProvider')
+
+        # Add the device certificate if necessary
+        if music_service.capabilities.requiresdevicecertificate:
+            # There may be an API call to get the certificate, but I haven't
+            # found one. This does the tricl.
+            response = requests.get(
+                'http://' + self._device.ip_address + ':1400/status/msdcert')
+            dom = XML.fromstring(response.content)
+            cert = dom.find('.//Cert')
+            device_cert = XML.SubElement(credentials_element, 'deviceCert')
+            device_cert.text = base64.b64encode(cert.text.encode(
+                'utf-8')).decode('utf-8')
+
+        # Add the zonePlayerId
+        if music_service.capabilities.includezoneplayerIDs:
+            player_id = XML.SubElement(credentials_element, 'zonePlayerId')
+            player_id.text = self._device_id
+
+        # The device provider is always 'Sonos'
+        device_provider = XML.SubElement(credentials_element, 'deviceProvider')
         device_provider.text = 'Sonos'
+
+        # Add a login token if account credentials are present
         if music_service.account.oa_device_id:
             # OAuth account credentials are present. We must use them to
             # authenticate.
@@ -101,7 +163,7 @@ class MusicServiceSoapClient(object):
             key.text = music_service.account.key
             household_id = XML.SubElement(login_token, 'householdId')
             household_id.text = self._device.household_id
-            credentials_header.append(login_token)
+            credentials_element.append(login_token)
 
         # otherwise, perhaps use DeviceLink or UserId auth
         elif music_service.auth_type in ['DeviceLink', 'UserId']:
@@ -112,12 +174,23 @@ class MusicServiceSoapClient(object):
             ])['SessionId']
             session_elt = XML.Element('sessionId')
             session_elt.text = session_id
-            credentials_header.append(session_elt)
+            credentials_element.append(session_elt)
 
-        # Anonymous auth. No need for anything further.
-        self._cached_soap_header = XML.tostring(
-            credentials_header,
-            encoding='utf-8').decode(encoding='utf-8')
+        # Now add a <context> element if necessary. At present,this only
+        # contains the timezone in the form "+/-HH:MM"
+        context_element_string = ''
+        if music_service.capabilities.includeSMAPIcontext:
+            context_element = XML.Element(
+                "context",
+                {'xmlns': "http://www.sonos.com/Services/1.1"})
+            timezone = XML.SubElement(context_element, 'timeZone')
+            timezone.text = ("-" if time.timezone > 0 else "+") + \
+                time.strftime("%H:%M", time.gmtime(abs(time.timezone)))
+            context_element_string = str(
+                XML.tostring((context_element)), 'utf-8')
+        self._cached_soap_header = str(
+            XML.tostring(credentials_element),
+            'utf-8') + context_element_string
         return self._cached_soap_header
 
     def call(self, method, args=None):
@@ -328,7 +401,7 @@ class MusicService(object):
         data = self.get_data_for_name(service_name)
         self.uri = data['Uri']
         self.secure_uri = data['SecureUri']
-        self.capabilities = data['Capabilities']
+        self.capabilities = Capabilities(int(data['Capabilities']))
         self.version = data['Version']
         self.container_type = data['ContainerType']
         self.service_id = data['Id']
@@ -630,10 +703,8 @@ class MusicService(object):
     ########################################################################
 
     #  Looking at various services, we see that the following SOAP methods
-    #  are implemented, but not all in each service. Probably, the
-    #  Capabilities property indicates which features are implemented, but
-    #  it is not clear precisely how. Some of the more common/useful
-    #  features have been wrapped into instance methods, below.
+    #  are implemented, but not all in each service. Some of the more
+    #  common/useful features have been wrapped into instance methods, below.
     #  See generally: http://musicpartners.sonos.com/node/81
 
     #    createItem(xs:string favorite)
@@ -699,9 +770,16 @@ class MusicService(object):
         Returns:
             ~collections.OrderedDict: The search results, or `None`.
 
+        Raises:
+            `MusicServiceException`: if the service does not support
+                searching or the particular category searched for
+
         See also:
             The Sonos `search API <http://musicpartners.sonos.com/node/86>`_
         """
+        if not self.capabilities.search:
+            raise MusicServiceException(
+                "%s does not allow searching" % self.service_name)
         search_category = self._get_search_prefix_map().get(category, None)
         if search_category is None:
             raise MusicServiceException(
@@ -733,7 +811,7 @@ class MusicService(object):
             [('id', item_id)])
         return response.get('getMediaMetadataResult', None)
 
-    def get_media_uri(self, item_id):
+    def get_media_uri(self, item_id, action=None, seconds_since_explicit=None):
         """Get a streaming URI for an item.
 
         Note:
@@ -747,14 +825,30 @@ class MusicService(object):
 
         Args:
             item_id (str): The item for which the URI is required
+            action (str): An implicit or explicit action (see the Sonos
+                `getMediaURI API <http://musicpartners.sonos.com/node/85>`_).
+                Default `None`
+            seconds_since_explicit (int): Time since the last queue-based
+                activitiy (see the Sonos
+                `getMediaURI API <http://musicpartners.sonos.com/node/85>`_).
+                Default `None`
 
         Returns:
-            str: The item's streaming URI.
+            dict: A dict containing the item's streaming URI, and any custom
+            http headers to be sent when the stream is requested
         """
-        response = self.soap_client.call(
-            'getMediaURI',
-            [('id', item_id)])
-        return response.get('getMediaURIResult', None)
+        # We should probably only send actions if
+        # capabilities.supportactions is True
+        params = [('id', item_id)]
+        if action is not None:
+            params.append(('action', action))
+        if seconds_since_explicit is not None:
+            params.append(('secondsSinceExplicit',
+                           str(seconds_since_explicit)))
+        response = self.soap_client.call('getMediaURI', params)
+        uri_result = response.get('getMediaURIResult', None)
+        headers = response.get('httpHeaders', None)
+        return {'uri': uri_result, 'headers': headers}
 
     def get_last_update(self):
         """Get last_update details for this music service.
@@ -777,7 +871,7 @@ class MusicService(object):
             item_id (str): The item for which metadata is required.
 
         Returns:
-            ~collections.OrderedDict: The item's extended metadata or None.
+            ~collections.OrderedDict: The item's extended metadata or `None`.
 
         See also:
             The Sonos `getExtendedMetadata API
@@ -794,12 +888,13 @@ class MusicService(object):
         Args:
             item_id (str): The item for which metadata is required
             metadata_type (str): The type of text to return, eg
-            ``'ARTIST_BIO'``, or ``'ALBUM_NOTES'``. Calling
-            `get_extended_metadata` for the item will show which extended
-            metadata_types are available (under relatedBrowse and relatedText).
+                ``'ARTIST_BIO'``, or ``'ALBUM_NOTES'``. Calling
+                `get_extended_metadata` for the item will show which
+                extended metadata_types are available (under relatedBrowse
+                and relatedText).
 
         Returns:
-            str: The item's extended metadata text or None
+            str: The item's extended metadata text or `None`.
 
         See also:
             The Sonos `getExtendedMetadataText API
@@ -819,8 +914,8 @@ def desc_from_uri(uri):
             ``'x-sonos-http:track%3a3402413.mp3?sid=2&amp;flags=32&amp;sn=4'``
 
     Returns:
-        str: The content of a desc element for that uri, eg
-            ``'SA_RINCON519_email@example.com'``
+        str: The content of a desc element for that uri,
+        eg ``'SA_RINCON519_email@example.com'``
     """
     #
     # If there is an sn parameter (which is the serial number of an account),

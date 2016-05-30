@@ -8,4 +8,5 @@ Submodules
 
    soco.music_services.accounts
    soco.music_services.music_service
+   soco.music_services.capabilities
 
